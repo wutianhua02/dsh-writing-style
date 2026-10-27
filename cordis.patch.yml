@@ -1,0 +1,5 @@
+# dsh-writing-style —— DSH bundle patch（挂载声明）
+# 装一次：宿主侧 4 个工具 + 会话投影 + 每轮风格注入 + 面板路由，客户端面板随包一起加载。
+- insert:
+    - id: writing-style
+      name: dsh-writing-style

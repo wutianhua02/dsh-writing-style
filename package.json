@@ -1,0 +1,53 @@
+{
+  "name": "dsh-writing-style",
+  "version": "0.1.0",
+  "description": "DSH 的写作风格插件：预设 + 13 个维度滑块 + 禁用词 + 范文 few-shot + 触发性条目，每轮注入成系统提示的硬规范；面板与模型工具都能改，改动记进会话日志可撤销。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": "./client.js",
+    "./style": "./lib/style.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "client.js",
+    "client",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "writing",
+    "style",
+    "tavern",
+    "roleplay",
+    "prompt"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node client/build.mjs",
+    "test": "node test/run.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "entry": "./client.js",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web"
+    }
+  }
+}
