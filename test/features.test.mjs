@@ -76,11 +76,25 @@ function post(route, body, sessionId) {
     route_handlers.get(route).call(null, req, res)
   })
 }
+function getRoute(route, sessionId) {
+  return new Promise((resolve) => {
+    const req = {
+      method: 'GET',
+      url: '/dsh-writing-style/' + route + (sessionId ? '?session=' + sessionId : ''),
+      headers: { host: '127.0.0.1:53026' },
+      on() {},
+    }
+    const res = { writeHead() {}, end(payload) { resolve(JSON.parse(payload)) } }
+    route_handlers.get(route).call(null, req, res)
+  })
+}
 const route_handlers = new Map()
 
 function attachRoutes(host) {
   route_handlers.clear()
   // 用一个通用 handler：路径决定 op，所以这里只挂一次
+  route_handlers.set('state', host.routes[0].handler)
+  route_handlers.set('presets', host.routes[0].handler)
   route_handlers.set('set', host.routes[0].handler)
   route_handlers.set('preset', host.routes[0].handler)
   route_handlers.set('write-preset', host.routes[0].handler)
@@ -129,7 +143,11 @@ test('write-preset：面板能直接写入一份全新预设，不需要先在�
   assert.ok(p, '预设必须写进 presets.json')
   assert.equal(p.name, '我的冷硬派')
   assert.equal(p.dims.sentence, 15)
-  assert.equal(p.dims.pov, 'first')
+  // ⚠️ pov 已退役：传进来必须被丢掉（存下去就是一份读不出来的脏数据），
+  // 同时要在 note 里告诉用户为什么少了一项 —— 不能静默消失。
+  assert.equal(Object.hasOwn(p.dims, 'pov'), false, '退役维度不能写进预设')
+  assert.ok((out.storedDims || []).includes('sentence'), '合法维度要回执')
+  assert.match(out.note || '', /移除|忽略/, '要说明视角/时态被忽略了')
   assert.equal(p.directives, '只写动作，不写心情。')
   assert.deepEqual(p.avoid, ['仿佛', '不禁'])
   assert.equal(p.sample, '雨停了三分钟。我把烟摁在墙上。')
@@ -138,6 +156,55 @@ test('write-preset：面板能直接写入一份全新预设，不需要先在�
   const listed = out.presets.find((x) => x.id === 'my-noir')
   assert.ok(listed, '写完之后必须能立刻被列出来')
   assert.equal(listed.custom, true)
+})
+
+test('更改内置预设 = 同 id 覆盖（卡片带 ★），删掉覆盖内置原版立刻回来', async () => {
+  // 面板改版后「更改」把内置预设也送进编辑器，保存走的就是同 id 覆盖：
+  // 覆盖存进 presets.json（custom:true ⇒ 界面上的 ★），删掉覆盖后内置必须原样回来。
+  // 这条链断在任何一环，用户看到的就是「改了没保存」或「删了内置没了」。
+  const { session } = bootWithSession()
+  const base = style.presetDims('balanced')
+  const mine = base.sentence === 25 ? 88 : 25
+
+  const w = await post('write-preset', {
+    id: 'balanced',
+    name: '我的均衡',
+    desc: '覆盖内置',
+    dims: { sentence: mine },
+    directives: '一句只写一个动作。',
+    avoid: ['仿佛'],
+    prefer: ['颗粒感'],
+    sample: '句子短，气压低。',
+  }, session.id)
+  assert.equal(w.ok, true, '写入失败：' + (w.error || ''))
+  const wCard = w.presets.find((p) => p.id === 'balanced')
+  assert.equal(wCard.custom, true, '覆盖内置后必须标成自定义（界面上的 ★）')
+  assert.equal(wCard.name, '我的均衡')
+
+  const saved = JSON.parse(readFileSync(presetsFile(), 'utf8'))
+  assert.equal(saved.find((p) => p.id === 'balanced').custom, true, '覆盖必须真的落盘')
+
+  const st = await getRoute('state', session.id)
+  const card = st.presets.find((p) => p.id === 'balanced')
+  assert.equal(card.custom, true)
+  assert.equal(card.dims.sentence, mine, '卡片必须带上覆盖后的维度')
+  assert.deepEqual(card.prefer, ['颗粒感'])
+  assert.equal(card.sample, '句子短，气压低。')
+  assert.equal(card.directives, '一句只写一个动作。')
+
+  const d = await post('delete-preset', { id: 'balanced' }, session.id)
+  const back = d.presets.find((p) => p.id === 'balanced')
+  assert.equal(back.custom, false, '删掉覆盖后内置必须回来')
+  assert.equal(back.name, '均衡')
+
+  const st2 = await getRoute('state', session.id)
+  const card2 = st2.presets.find((p) => p.id === 'balanced')
+  const builtin = style.allPresets([]).find((p) => p.id === 'balanced')
+  assert.deepEqual(card2.dims, builtin.dims, '删掉覆盖后维度回到内置原版')
+  assert.equal(card2.name, builtin.name)
+  assert.deepEqual(card2.prefer, [], '内置没有偏好词，覆盖删掉后不能残留')
+  assert.equal(card2.sample, '', '内置没有范文，覆盖删掉后不能残留')
+  assert.equal(card2.directives, builtin.directives, '覆盖里的附加要求不能残留')
 })
 
 test('write-preset：与「均衡」相同的维度不落盘（日后加旋钮不会让老预设失效）', async () => {

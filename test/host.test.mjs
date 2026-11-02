@@ -9,6 +9,8 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { assertSupportedJsonSchema, JsonSchemaError } from './support/host-schema.mjs'
+import { loadRealHostValidator } from './support/real-host-schema.mjs'
 
 // 必须在 import 插件之前设好：启动探针会往 $DSH_HOME 写 boot.log
 const HOME = mkdtempSync(join(tmpdir(), 'dsh-writing-style-'))
@@ -48,9 +50,20 @@ function makeHost(opts = {}) {
   const projections = []
   const routes = []
   const disposers = []
+  const omit = new Set(opts.omit || [])
+  const blocks = []
 
   const services = {
-    tools: { register: (def) => { tools.push(def); return () => {} } },
+    // ⚠️ 真宿主 `tools.register()` 第一行就是 assertSupportedJsonSchema(output.schema)：
+    // 不合法直接抛。以前这里的 register 无条件收下，于是 `type:'json'` 在测试里
+    // 106 项全绿、真机 4 个工具全都注册不上。假宿主必须照着宿主的行为抛。
+    tools: {
+      register: (def) => {
+        assertSupportedJsonSchema(def.output.schema)
+        tools.push(def)
+        return () => {}
+      },
+    },
     sessionProjections: { register: (def) => { projections.push(def); return () => {} } },
     systemPrompt: {
       section: (def) => { sections.push(def); return () => {} },
@@ -61,15 +74,28 @@ function makeHost(opts = {}) {
     webServer: { register: (def) => { routes.push(def); return () => {} } },
     agents: { list: () => (opts.agents || []) },
   }
+  for (const name of omit) delete services[name]
 
   const root = {
     effect: (fn) => { const d = fn(); if (typeof d === 'function') disposers.push(d); return () => {} },
     on: (name, fn) => { (root._handlers[name] = root._handlers[name] || []).push(fn); return () => {} },
     _handlers: {},
     get: (n) => services[n],
-    inject: (_names, fn) => fn({ get: (n) => services[n], get agent() { return opts.agent || null } }),
+    // 复刻 Cordis：inject 声明的服务**缺任何一个，整块就不会跑**；
+    // 而且块内 `get(name)` 只回答**声明过**的名字 —— 这就是真机上
+    // 「顺手 get('webServer') 得到 undefined → route-skipped」的病灶。
+    inject: (names, fn) => {
+      blocks.push(names.slice())
+      const missing = names.filter((n) => !services[n])
+      if (missing.length) return undefined
+      const declared = new Set(names)
+      return fn({
+        get: (n) => (declared.has(n) ? services[n] : undefined),
+        get agent() { return opts.agent || null },
+      })
+    },
   }
-  return { root, services, tools, sections, contexts, projections, routes, disposers }
+  return { root, services, tools, sections, contexts, projections, routes, disposers, blocks, omit }
 }
 
 function boot(opts = {}) {
@@ -129,15 +155,55 @@ test('启用后段落渲染出完整规范，且带本轮自检', () => {
 
   // 用工具把风格打开（走真实写入路径）
   const setTool = host.tools.find((t) => t.name === 'style_set')
-  const out = setTool.execute({ enabled: true, dims: ['sentence:20', 'pov:first'] }, { agent: { session } })
+  const out = setTool.execute({ enabled: true, dims: ['sentence:20', 'pace:80'] }, { agent: { session } })
   assert.equal(out.ok, true)
   assert.equal(out.enabled, true)
 
   const text = sec.text({ agent: { session } })
   assert.match(text, /写作风格 · 硬性规范/)
-  assert.match(text, /第一人称/)
   assert.match(text, /极短句/)
   assert.match(text, /落笔前自检/)
+  // 视角/时态已按用户要求取消，规范里不能再出现它们的文本
+  assert.doesNotMatch(text, /第一人称|过去时|视角与时态/)
+})
+
+test('style_set 传已退役的 pov/tense：不崩、不动数值、明确告知原因', () => {
+  const host = boot()
+  const session = makeSession()
+  host.root._handlers['session/created'].forEach((fn) => fn(session))
+  const setTool = host.tools.find((t) => t.name === 'style_set')
+  const out = setTool.execute({ enabled: true, dims: ['pov:first', 'tense:past', 'sentence:20'] }, { agent: { session } })
+  assert.equal(out.ok, true)
+  assert.equal(out.dims.pov, undefined, 'pov 不能再进文档')
+  assert.equal(out.dims.tense, undefined, 'tense 不能再进文档')
+  assert.equal(out.dims.sentence, 20, '同一批里合法的那项必须照常生效')
+  const warns = (out.warnings || []).join('\n')
+  assert.match(warns, /移除/, '退役维度要给「已移除」这种能看懂的理由，不能只说未知')
+})
+
+test('style_set 用中文旧名「视角/时态」也说「已移除」，不说「未知维度」', () => {
+  // 用户实际会这么要求，模型也就这么传。这是本次报障的直接场景。
+  const host = boot()
+  const session = makeSession()
+  host.root._handlers['session/created'].forEach((fn) => fn(session))
+  const setTool = host.tools.find((t) => t.name === 'style_set')
+  const out = setTool.execute({ enabled: true, dims: ['视角:第一人称', '时态:过去时', 'pace:80'] }, { agent: { session } })
+  assert.equal(out.ok, true)
+  const warns = (out.warnings || []).join('\n')
+  assert.match(warns, /叙事视角」已从本插件移除/)
+  assert.match(warns, /叙述时态」已从本插件移除/)
+  assert.doesNotMatch(warns, /未知维度/, '中文旧名不能再算「未知维度」')
+  assert.equal(out.dims.pace, 80, '同批里合法的那项照常生效')
+})
+
+test('style_get 不带 presets 也返回 dimRef.retired（模型该知道视角已取消）', () => {
+  const host = boot()
+  const session = makeSession()
+  host.root._handlers['session/created'].forEach((fn) => fn(session))
+  const getTool = host.tools.find((t) => t.name === 'style_get')
+  const out = getTool.execute({}, { agent: { session } })
+  assert.deepEqual(out.dimRef.retired, ['pov', 'tense'])
+  assert.equal(out.presets, undefined)
 })
 
 test('触发性条目走独立的 context，且按最近消息命中', () => {
@@ -224,24 +290,51 @@ test('两次写入都进日志，undo 回到上一份', () => {
 
 // ---------------------------------------------------------------- 工具契约
 
-test('四个工具的名字、参数形状都能被宿主 dsh-tools 编译', async () => {
+test('四个工具的参数形状符合宿主契约：完整 JSON Schema，原样发给上游', async () => {
   const host = boot()
   const names = host.tools.map((t) => t.name).sort()
   assert.deepEqual(names, ['style_get', 'style_preset', 'style_rules', 'style_set'])
 
-  // 用宿主真实的参数编译器验一遍（拿不到就跳过，不误判）
-  let compile = null
+  // ⚠️ 宿主对「工具参数」有**两种写法**，对应两条不同的路，别混：
+  //   · 插件 `ctx.tools.register({ parameters })`：parameters 原样发给上游
+  //     （dsh-llm-pi-ai 里就是 `parameters: tool.parameters`），所以必须是
+  //     完整 JSON Schema：{ type:'object', properties:{…}, required? }。
+  //   · 宿主自家 `defineTool({ parameters })`：parameters 是「裸映射」，
+  //     由 `parameterSchemaSpecToJsonSchema()` 编译成上面那个形状。
+  // 2026-11-01 这一项红过一次：它拿「裸映射 → JSON Schema」的编译器去喂
+  // 已经成型的 JSON Schema，得到 `parameters.type must be a value schema object`。
+  // 那是**用错编译器**（宿主从未要求插件交裸映射），不是插件退版 ——
+  // 上游报错的形状 `type: null` 才是真正要防的（那条由 tool-schema.test.mjs 钉住）。
+  let real = null
+  try { real = await loadRealHostValidator() } catch { real = null }
+  let specCompiler = null
   try {
-    const tools = await import('file:///E:/dsh/resources/app/dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js')
-    compile = tools.parameterSchemaSpecToJsonSchema
-  } catch { /* 换机器时跳过 */ }
-  if (!compile) return
+    const api = await import('file:///E:/dsh/resources/app/dsh/node_modules/@deepseek-ai/dsh-tools/lib/index.js')
+    specCompiler = api.parameterSchemaSpecToJsonSchema
+  } catch { /* 换机器就跳过反证，不误判 */ }
 
   for (const t of host.tools) {
-    assert.doesNotThrow(() => compile(t.parameters), t.name + ' 的参数不合宿主要求')
-    const json = compile(t.parameters)
-    assert.equal(json.type, 'object')
-    assert.ok(json.properties && typeof json.properties === 'object')
+    assert.equal(t.parameters.type, 'object', t.name + ' 的 parameters 根部必须是 type:"object"')
+    assert.ok(t.parameters.properties && typeof t.parameters.properties === 'object', t.name + ' 必须声明 properties')
+    if (real) {
+      assert.doesNotThrow(
+        () => real.assertSupportedJsonSchema(t.parameters),
+        t.name + ' 的 parameters 不在宿主支持的 schema 子集里',
+      )
+    }
+  }
+
+  if (specCompiler) {
+    // 反证一：裸映射过一遍编译器，得到的正是我们现在手写的形状 —— 两种写法等价。
+    const compiled = specCompiler({ presets: { type: 'boolean', description: 'x' } })
+    assert.equal(compiled.type, 'object')
+    assert.deepEqual(Object.keys(compiled.properties), ['presets'])
+
+    // 反证二：把已成型的 JSON Schema 再喂回参数编译器必抛 —— 这正是上一版红的那个错。
+    assert.throws(
+      () => specCompiler(host.tools[0].parameters),
+      /must be a value schema object/,
+    )
   }
 })
 
@@ -307,6 +400,28 @@ test('面板路由注册在 /dsh-writing-style 前缀下', () => {
   assert.equal(host.routes[0].kind, 'prefix')
   assert.equal(host.routes[0].path, '/dsh-writing-style')
   assert.equal(typeof host.routes[0].handler, 'function')
+})
+
+test('没有 webServer 的宿主形态：工具照常、只是没有面板路由', () => {
+  // 这就是把路由拆成独立 inject 块的理由。真机 2026-10-31T09:43 那条
+  // boot.log `route-skipped` 的病灶是：主块只声明了 tools/sessionProjections/
+  // systemPrompt，块内 `sctx.get('webServer')` 拿到 undefined →
+  // installRoute 静默 return false → 面板空白，且不抛任何错。
+  // 拆开后，缺服务的那块**整块不跑**，其余功能不受牵连。
+  const host = boot({ omit: ['webServer'] })
+  assert.equal(host.tools.length, 4, '工具不依赖 webServer')
+  assert.equal(host.routes.length, 0, '没有 webServer 就不该有路由')
+  assert.equal(host.blocks.length, 2, '应有两个 inject 块：功能块 + 路由块')
+
+  const routeBlock = host.blocks.find((l) => l.includes('webServer'))
+  assert.ok(routeBlock, '路由块的 inject 声明里必须有 webServer')
+  assert.ok(routeBlock.includes('agents'), 'findSession 用 agents，也要声明')
+  // ⚠️ connection 故意不声明：没有它的宿主会让整块永远等下去（面板直接没了）。
+  assert.ok(!routeBlock.includes('connection'), 'connection 不能进 inject 声明')
+
+  const mainBlock = host.blocks.find((l) => l.includes('tools'))
+  assert.ok(mainBlock, '功能块的声明里必须有 tools')
+  assert.ok(!mainBlock.includes('webServer'), 'webServer 不能靠功能块「顺手 get」')
 })
 
 test('路由拒绝非回环 Host（面板写入不能被外部页面驱动）', async () => {

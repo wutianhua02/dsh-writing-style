@@ -22,6 +22,8 @@ ${src}
     exports.name = name;
     exports.inject = inject;
     exports.apply = apply;
+    // 测试缝：并发契约只能从 RPC 层验（组件只看得到结果，看不到「这次请求到底发没发」）。
+    exports.__rpcForTest = __rpcForTest;
     return module.exports;
   }
 });
